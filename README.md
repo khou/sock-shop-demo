@@ -1,7 +1,3 @@
-# Kubernetes Manifests
-
-Contains Kubernetes manifests for deploying Sock Shop.
-
 ## Directories
 
 - `manifests/` - Core Sock Shop services
