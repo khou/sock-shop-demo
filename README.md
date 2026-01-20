@@ -1,3 +1,6 @@
+# Sock Shop Demo
+Please deploy this after creating a local k8s via kind or minikube.
+
 ## Directories
 
 - `manifests/` - Core Sock Shop services
