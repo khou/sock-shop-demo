@@ -1,0 +1,15 @@
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Editors
+.idea
+*.iws
+*.iml
+.vscode
+
+# Temp files
+*.tmp
+*~
