@@ -71,7 +71,7 @@ fi
 
 # Port forward Grafana (to port 3001 as requested)
 echo -e "${BLUE}Waiting for Grafana pod...${NC}"
-kubectl wait --for=condition=ready pod -l app=grafana -n ${MONITORING_NAMESPACE} --timeout=120s || true
+kubectl wait --for=condition=ready pod -l app=grafana,component=core -n ${MONITORING_NAMESPACE} --timeout=120s || true
 GRAFANA_POD=$(get_pod ${MONITORING_NAMESPACE} "app=grafana,component=core" 10)
 if [ -n "${GRAFANA_POD}" ]; then
     echo -e "${GREEN}Forwarding Grafana (http://localhost:3001)${NC}"
