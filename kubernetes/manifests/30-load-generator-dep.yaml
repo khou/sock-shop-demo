@@ -24,7 +24,8 @@ spec:
             - -c
             - |
               BASE="http://front-end.sock-shop.svc.cluster.local"
-              
+              CARTS="http://carts.sock-shop.svc.cluster.local"
+
               # Product IDs from catalogue
               PRODUCTS="
               3395a43e-2d88-40de-b95f-e00e1502085b
@@ -50,56 +51,74 @@ spec:
                 curl -s "$BASE/catalogue" > /dev/null
                 curl -s "$BASE/catalogue?size=5" > /dev/null
                 curl -s "$BASE/category.html?tags=sport" > /dev/null
-                
+                curl -s "$BASE/catalogue?tags=sport" > /dev/null
+                curl -s "$BASE/catalogue/size?tags=sport" > /dev/null
+                curl -s "$BASE/tags" > /dev/null
+
                 # View random product detail
                 PROD=$(echo "$PRODUCTS" | tr -s ' \n' '\n' | grep -v '^$' | shuf -n1)
                 curl -s "$BASE/detail.html?id=$PROD" > /dev/null
+                curl -s "$BASE/catalogue/$PROD" > /dev/null
                 log "ACTION=view_product product_id=$PROD"
               }
               
-              # Register new user
-              register() {
+              # Register new user - sets global LAST_COOKIE and LAST_CUSTOMER_ID
+              LAST_COOKIE=""
+              LAST_CUSTOMER_ID=""
+
+              register_and_login() {
                 USER_COUNT=$((USER_COUNT + 1))
                 USERNAME="testuser${USER_COUNT}_$(date +%s)"
                 PASSWORD="password123"
                 EMAIL="${USERNAME}@test.com"
-                
+
                 log "ACTION=register username=$USERNAME"
-                curl -s -X POST "$BASE/register" \
+                TMPFILE="/tmp/cookies_$$"
+                # Registration returns {"id":"<customer_id>"}
+                RESPONSE=$(curl -s -c "$TMPFILE" -X POST "$BASE/register" \
                   -H "Content-Type: application/json" \
-                  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\",\"email\":\"$EMAIL\",\"firstName\":\"Test\",\"lastName\":\"User\"}" > /dev/null
-                
-                echo "$USERNAME:$PASSWORD"
+                  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\",\"email\":\"$EMAIL\",\"firstName\":\"Test\",\"lastName\":\"User\"}")
+
+                # Extract cookie value (7th field in Netscape cookie file)
+                LAST_COOKIE=$(grep logged_in "$TMPFILE" 2>/dev/null | awk '{print $7}')
+                rm -f "$TMPFILE"
+
+                # Extract customer ID from registration response (supports hex with uppercase and dashes)
+                LAST_CUSTOMER_ID=$(echo "$RESPONSE" | grep -o '"id":"[0-9a-fA-F-]*"' | head -1 | cut -d'"' -f4)
+
+                if [ -z "$LAST_COOKIE" ]; then
+                  log "ACTION=register_failed username=$USERNAME"
+                  LAST_CUSTOMER_ID=""
+                  return 1
+                fi
+
+                log "ACTION=register_success username=$USERNAME customer_id=$LAST_CUSTOMER_ID"
+                return 0
               }
               
-              # Login
-              login() {
-                CREDS="$1"
-                USER=$(echo "$CREDS" | cut -d: -f1)
-                PASS=$(echo "$CREDS" | cut -d: -f2)
-                
-                log "ACTION=login username=$USER"
-                COOKIE=$(curl -s -c - -X GET "$BASE/login" -u "$USER:$PASS" 2>/dev/null | grep logged_in | awk '{print $NF}')
-                echo "$COOKIE"
-              }
-              
-              # Add item to cart
+              # Add item to cart - calls carts service directly
               add_to_cart() {
-                COOKIE="$1"
+                CUSTOMER_ID="$1"
                 PROD=$(echo "$PRODUCTS" | tr -s ' \n' '\n' | grep -v '^$' | shuf -n1)
-                
-                log "ACTION=add_to_cart product_id=$PROD"
-                curl -s -X POST "$BASE/cart" \
+
+                log "ACTION=add_to_cart customer_id=$CUSTOMER_ID product_id=$PROD"
+                if ! curl -s -f -X POST "$CARTS/carts/$CUSTOMER_ID/items" \
                   -H "Content-Type: application/json" \
-                  -b "logged_in=$COOKIE" \
-                  -d "{\"id\":\"$PROD\"}" > /dev/null
+                  -d "{\"itemId\":\"$PROD\",\"quantity\":1,\"unitPrice\":9.99}" > /dev/null; then
+                  log "ACTION=add_to_cart_failed customer_id=$CUSTOMER_ID product_id=$PROD"
+                  return 1
+                fi
+                return 0
               }
               
-              # View cart
+              # View cart - calls carts service directly
               view_cart() {
-                COOKIE="$1"
-                log "ACTION=view_cart"
-                curl -s "$BASE/cart" -b "logged_in=$COOKIE" > /dev/null
+                CUSTOMER_ID="$1"
+                COOKIE="$2"
+                log "ACTION=view_cart customer_id=$CUSTOMER_ID"
+                # Call carts service directly to trigger get_items logging
+                curl -s "$CARTS/carts/$CUSTOMER_ID/items" > /dev/null
+                # Also call front-end for the UI
                 curl -s "$BASE/basket.html" -b "logged_in=$COOKIE" > /dev/null
               }
               
@@ -111,12 +130,18 @@ spec:
                   -b "logged_in=$COOKIE" > /dev/null
               }
               
-              # Delete item from cart
+              # Delete item from cart - calls carts service directly
               delete_from_cart() {
-                COOKIE="$1"
-                log "ACTION=delete_from_cart"
-                curl -s -X DELETE "$BASE/cart" \
-                  -b "logged_in=$COOKIE" > /dev/null
+                CUSTOMER_ID="$1"
+                # Get first item ID from cart using grep for reliable JSON extraction
+                CART_RESPONSE=$(curl -s "$CARTS/carts/$CUSTOMER_ID/items")
+                ITEM_ID=$(echo "$CART_RESPONSE" | grep -o '"itemId":"[^"]*"' | head -1 | cut -d'"' -f4)
+                if [ -n "$ITEM_ID" ]; then
+                  log "ACTION=delete_from_cart customer_id=$CUSTOMER_ID item_id=$ITEM_ID"
+                  curl -s -X DELETE "$CARTS/carts/$CUSTOMER_ID/items/$ITEM_ID" > /dev/null
+                else
+                  log "ACTION=delete_from_cart customer_id=$CUSTOMER_ID status=cart_empty"
+                fi
               }
               
               # View orders
@@ -130,35 +155,38 @@ spec:
               # Full user journey
               full_journey() {
                 log "JOURNEY=full_purchase starting"
-                
-                # Register and login
-                CREDS=$(register)
+
+                # Register (sets LAST_COOKIE and LAST_CUSTOMER_ID)
+                if ! register_and_login; then
+                  log "JOURNEY=full_purchase failed - registration error"
+                  return
+                fi
+                COOKIE="$LAST_COOKIE"
+                CUSTOMER_ID="$LAST_CUSTOMER_ID"
                 sleep 1
-                COOKIE=$(login "$CREDS")
-                sleep 1
-                
+
                 # Browse
                 browse
                 sleep 1
-                
-                # Add 2-3 items to cart
+
+                # Add 2-3 items to cart (calls carts service directly)
                 ITEMS=$((RANDOM % 2 + 2))
                 for i in $(seq 1 $ITEMS); do
-                  add_to_cart "$COOKIE"
+                  add_to_cart "$CUSTOMER_ID"
                   sleep 1
                 done
-                
-                # View cart
-                view_cart "$COOKIE"
+
+                # View cart (calls carts service directly)
+                view_cart "$CUSTOMER_ID" "$COOKIE"
                 sleep 1
-                
-                # Checkout
+
+                # Checkout (still via front-end)
                 checkout "$COOKIE"
                 sleep 1
-                
+
                 # View orders
                 view_orders "$COOKIE"
-                
+
                 log "JOURNEY=full_purchase completed"
               }
               
@@ -174,23 +202,35 @@ spec:
               # Cart abandonment journey
               abandon_cart_journey() {
                 log "JOURNEY=cart_abandonment starting"
-                
-                CREDS=$(register)
+
+                # Register (sets LAST_COOKIE and LAST_CUSTOMER_ID)
+                if ! register_and_login; then
+                  log "JOURNEY=cart_abandonment failed - registration error"
+                  return
+                fi
+                COOKIE="$LAST_COOKIE"
+                CUSTOMER_ID="$LAST_CUSTOMER_ID"
                 sleep 1
-                COOKIE=$(login "$CREDS")
-                sleep 1
-                
+
                 browse
                 sleep 1
-                
-                add_to_cart "$COOKIE"
+
+                # Add items directly to carts service
+                add_to_cart "$CUSTOMER_ID"
                 sleep 1
-                add_to_cart "$COOKIE"
+                add_to_cart "$CUSTOMER_ID"
                 sleep 1
-                
-                view_cart "$COOKIE"
+
+                # View cart (calls carts service directly)
+                view_cart "$CUSTOMER_ID" "$COOKIE"
+
+                # Sometimes delete an item before abandoning
+                if [ $((RANDOM % 2)) -eq 0 ]; then
+                  sleep 1
+                  delete_from_cart "$CUSTOMER_ID"
+                fi
+
                 # No checkout - abandoned
-                
                 log "JOURNEY=cart_abandonment completed"
               }
               
